@@ -1,0 +1,6 @@
+id=http_custom_headers_vpn
+name=HTTP Custom Headers VPN (Go)
+version=2.0.0
+versionCode=200
+author=Community build
+description=Go SSH tunnel with local web control panel for KernelSU ARM64
