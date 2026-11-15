@@ -12,30 +12,57 @@ permissions:
 
 jobs:
   build:
+    name: Build Android ARM64
     runs-on: ubuntu-24.04
 
     steps:
+      # =========================================
+      # CHECKOUT
+      # =========================================
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # =========================================
+      # GO
+      # =========================================
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
           cache: true
 
-      - name: Install build dependencies
+      # =========================================
+      # DEPENDENCIES
+      # =========================================
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake unzip zip curl file
+          set -euo pipefail
 
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            unzip \
+            zip \
+            curl \
+            file \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            make
+
+      # =========================================
+      # ANDROID NDK
+      # =========================================
       - name: Install Android NDK
         shell: bash
         run: |
           set -euo pipefail
-          NDK_VERSION=27.2.12479018
-          NDK_ARCHIVE=android-ndk-r27d-linux.zip
+
+          NDK_VERSION="27.2.12479018"
+          NDK_ARCHIVE="android-ndk-r27d-linux.zip"
 
           curl -fL --retry 3 \
             "https://dl.google.com/android/repository/${NDK_ARCHIVE}" \
@@ -45,37 +72,64 @@ jobs:
             -d "$RUNNER_TEMP"
 
           mkdir -p "$ANDROID_HOME/ndk"
+
           mv "$RUNNER_TEMP/android-ndk-r27d" \
             "$ANDROID_HOME/ndk/$NDK_VERSION"
 
-      - name: Build Go VPN engine
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" \
+            >> "$GITHUB_ENV"
+
+      # =========================================
+      # CHECK SOURCE
+      # =========================================
+      - name: Check source files
+        run: |
+          set -euo pipefail
+
+          test -f go.mod
+          test -f libs/redsocks.zip
+          test -f libs/dns2socks.zip
+          test -d cmd/vpn-engine
+
+          echo "Source files OK"
+
+      # =========================================
+      # BUILD GO ENGINE
+      # =========================================
+      - name: Build Go VPN Engine
         env:
           GOOS: linux
           GOARCH: arm64
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
+
           mkdir -p bin
+
           go mod tidy
-          go build -trimpath \
+
+          go build \
+            -trimpath \
             -ldflags="-s -w" \
             -o bin/vpn-engine \
             ./cmd/vpn-engine
 
-      - name: Build redsocks ARM64
+          chmod 755 bin/vpn-engine
+
+      # =========================================
+      # BUILD LIBEVENT
+      # =========================================
+      - name: Build libevent for Android ARM64
         shell: bash
         run: |
           set -euo pipefail
 
-          NDK="$ANDROID_HOME/ndk/27.2.12479018"
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK="$ANDROID_NDK_HOME"
 
-          export CC="$TC/aarch64-linux-android24-clang"
-          export AR="$TC/llvm-ar"
-          export RANLIB="$TC/llvm-ranlib"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
 
-          mkdir -p build bin
-          unzip -q libs/redsocks.zip -d build
+          mkdir -p build
 
           curl -fL --retry 3 \
             https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz \
@@ -83,30 +137,66 @@ jobs:
 
           tar -xzf build/libevent.tar.gz -C build
 
-          cmake -S build/libevent-2.1.12-stable \
+          rm -rf build/libevent-out
+          rm -rf build/libevent-install
+
+          cmake \
+            -S build/libevent-2.1.12-stable \
             -B build/libevent-out \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=24 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_HAVE_LIBC_PTHREAD=ON \
+            -DTHREADS_PREFER_PTHREAD_FLAG=OFF \
+            -DCMAKE_THREAD_LIBS_INIT="" \
             -DEVENT__DISABLE_OPENSSL=ON \
             -DEVENT__DISABLE_TESTS=ON \
             -DEVENT__DISABLE_SAMPLES=ON \
             -DCMAKE_INSTALL_PREFIX="$PWD/build/libevent-install"
 
           cmake --build build/libevent-out \
-            --target install -j2
+            --target install \
+            --parallel 2
 
-          cd build/redsocks
+          echo "LIBEVENT build completed"
 
-          printf '#define USE_IPTABLES\n' > config.h
-          mkdir -p gen
+      # =========================================
+      # BUILD REDSOCKS
+      # =========================================
+      - name: Build redsocks Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          printf '#include "../version.h"\nconst char* redsocks_version = "redsocks/android";\n' \
-            > gen/version.c
+          NDK="$ANDROID_NDK_HOME"
 
-          export CFLAGS="-O2 -fPIE -I$PWD/../libevent-install/include"
-          export LDFLAGS="-pie -L$PWD/../libevent-install/lib"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          export CC="$TOOLCHAIN/aarch64-linux-android24-clang"
+          export AR="$TOOLCHAIN/llvm-ar"
+          export RANLIB="$TOOLCHAIN/llvm-ranlib"
+
+          mkdir -p build/redsocks-src bin
+
+          unzip -q libs/redsocks.zip \
+            -d build/redsocks-src
+
+          REDSOCKS_DIR="$(find build/redsocks-src \
+            -type f -name Makefile -print -quit | xargs dirname)"
+
+          if [ -z "$REDSOCKS_DIR" ] || [ ! -f "$REDSOCKS_DIR/Makefile" ]; then
+            echo "redsocks Makefile not found"
+            exit 1
+          fi
+
+          echo "Using redsocks source: $REDSOCKS_DIR"
+
+          cd "$REDSOCKS_DIR"
+
+          export CFLAGS="-O2 -fPIE -I$GITHUB_WORKSPACE/build/libevent-install/include"
+          export LDFLAGS="-pie -L$GITHUB_WORKSPACE/build/libevent-install/lib"
 
           make -j2 \
             CC="$CC" \
@@ -114,56 +204,123 @@ jobs:
             LDFLAGS="$LDFLAGS" \
             LIBS="-levent_core"
 
-          cp redsocks ../../bin/redsocks
+          REDSOCKS_BIN="$(find . -type f -name redsocks -perm -111 -print -quit)"
 
-      - name: Build dns2socks ARM64
+          if [ -z "$REDSOCKS_BIN" ]; then
+            echo "redsocks binary not found after build"
+            exit 1
+          fi
+
+          cp "$REDSOCKS_BIN" "$GITHUB_WORKSPACE/bin/redsocks"
+
+          chmod 755 "$GITHUB_WORKSPACE/bin/redsocks"
+
+          echo "redsocks build completed"
+
+      # =========================================
+      # BUILD DNS2SOCKS
+      # =========================================
+      - name: Build dns2socks Android ARM64
         shell: bash
         run: |
           set -euo pipefail
 
-          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          NDK="$ANDROID_NDK_HOME"
+
           CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 
-          mkdir -p build bin
-          unzip -q libs/dns2socks.zip -d build
+          mkdir -p build/dns2socks-src bin
 
-          cd build/dns2socks
+          unzip -q libs/dns2socks.zip \
+            -d build/dns2socks-src
 
-          "$CC" -O2 -fPIE -pie -pthread \
-            dns2socks.c \
-            -o ../../bin/dns2socks
+          mapfile -t SOURCES < <(
+            find build/dns2socks-src \
+              -type f -name '*.c' \
+              ! -path '*/test/*' \
+              ! -path '*/tests/*'
+          )
 
-      - name: Verify binaries
+          if [ "${#SOURCES[@]}" -eq 0 ]; then
+            echo "No C source files found in dns2socks.zip"
+            exit 1
+          fi
+
+          echo "DNS2SOCKS source files:"
+          printf '%s\n' "${SOURCES[@]}"
+
+          "$CC" \
+            -O2 \
+            -fPIE \
+            -pie \
+            -pthread \
+            "${SOURCES[@]}" \
+            -o bin/dns2socks
+
+          chmod 755 bin/dns2socks
+
+          echo "dns2socks build completed"
+
+      # =========================================
+      # VERIFY BINARIES
+      # =========================================
+      - name: Verify ARM64 binaries
         run: |
-          set -e
-          chmod 755 bin/*
-          file bin/*
-          readelf -h bin/vpn-engine
+          set -euo pipefail
+
+          for binary in \
+            bin/vpn-engine \
+            bin/redsocks \
+            bin/dns2socks
+          do
+            if [ ! -f "$binary" ]; then
+              echo "Missing binary: $binary"
+              exit 1
+            fi
+
+            chmod 755 "$binary"
+
+            echo "Checking $binary"
+            file "$binary"
+          done
+
           readelf -h bin/redsocks
           readelf -h bin/dns2socks
 
+      # =========================================
+      # PACKAGE KERNELSU MODULE
+      # =========================================
       - name: Package KernelSU module
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
+          test -f module.prop
+          test -f service.sh
+          test -f action.sh
+          test -f uninstall.sh
+
           mkdir -p dist
 
-          zip -r dist/HTTP-CUSTOM-HEADERS-VPN-KSU-arm64.zip \
-            module.prop \
-            customize.sh \
-            service.sh \
-            action.sh \
-            uninstall.sh \
-            scripts \
-            vpn \
-            cfgs \
-            web \
-            bin \
-            README.md
+          zip -r \
+            dist/HTTP-CUSTOM-HEADERS-VPN-KSU-arm64.zip \
+            . \
+            -x ".git/*" \
+               ".github/*" \
+               "build/*" \
+               "dist/*" \
+               "*.zip"
 
-      - name: Upload build artifact
+          echo "Module package completed"
+
+      # =========================================
+      # UPLOAD ARTIFACT
+      # =========================================
+      - name: Upload ARM64 module
         uses: actions/upload-artifact@v4
         with:
           name: HTTP-CUSTOM-HEADERS-VPN-KSU-arm64
           path: dist/HTTP-CUSTOM-HEADERS-VPN-KSU-arm64.zip
           if-no-files-found: error
+          compression-level: 0
           
