@@ -1,0 +1,73 @@
+name: Build KernelSU ARM64 module
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK and build tools
+        run: |
+          sdkmanager "ndk;27.2.12479018" "cmake;3.22.1"
+          sudo apt-get update
+          sudo apt-get install -y unzip zip
+      - name: Build ARM64 Go engine
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p bin
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o bin/vpn-engine ./cmd/vpn-engine
+      - name: Build bundled redsocks and dns2socks for Android ARM64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$TC/aarch64-linux-android24-clang"
+          export AR="$TC/llvm-ar" RANLIB="$TC/llvm-ranlib"
+          mkdir -p bin build
+          unzip -q libs/redsocks.zip -d build
+          unzip -q libs/dns2socks.zip -d build
+          curl -L --fail https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz -o build/libevent.tar.gz
+          tar -xzf build/libevent.tar.gz -C build
+          cmake -S build/libevent-2.1.12-stable -B build/libevent-out \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DCMAKE_BUILD_TYPE=Release \
+            -DEVENT__DISABLE_OPENSSL=ON -DEVENT__DISABLE_TESTS=ON -DEVENT__DISABLE_SAMPLES=ON \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build/libevent-install"
+          cmake --build build/libevent-out --target install -j2
+          cd build/redsocks
+          printf '#define USE_IPTABLES\n' > config.h
+          mkdir -p gen
+          printf '#include "../version.h"\nconst char* redsocks_version = "redsocks/0.5-android";\n' > gen/version.c
+          export CFLAGS="-O2 -fPIE -I$PWD/../libevent-install/include"
+          export LDFLAGS="-pie -L$PWD/../libevent-install/lib"
+          make SHELL=/bin/bash -j2 CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS" LIBS="-levent_core"
+          cp redsocks ../../bin/redsocks
+          cd ../dns2socks
+          "$CC" -O2 -fPIE -pie -pthread dns2socks.c -o ../../bin/dns2socks
+          cd ../..
+          chmod 755 bin/*
+          file bin/*
+      - name: Package module
+        run: |
+          mkdir -p dist
+          zip -r dist/HTTP-CUSTOM-HEADERS-VPN-KSU-arm64.zip \
+            module.prop customize.sh service.sh action.sh uninstall.sh \
+            scripts vpn cfgs web bin README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HTTP-CUSTOM-HEADERS-VPN-KSU-arm64
+          path: dist/HTTP-CUSTOM-HEADERS-VPN-KSU-arm64.zip
+          
