@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -157,7 +158,7 @@ func dialTunnel(c Config) (net.Conn, error) {
 }
 
 // Separate file helper avoids TLS configuration details in the request handlers.
-func tlsClient(c net.Conn, serverName string) net.Conn { return newTLSClient(c, serverName) }
+func tlsClient(c net.Conn, serverName string) *tls.Conn { return newTLSClient(c, serverName) }
 
 func connectSSH(c Config) error {
 	conn, err := dialTunnel(c)
