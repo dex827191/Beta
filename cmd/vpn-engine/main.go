@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -97,16 +98,108 @@ func saveConfig(c Config) error {
 	return os.WriteFile(cfgPath(), b, 0600)
 }
 
+// bufferedConn preserves bytes already read while parsing a proxy response.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+// expandPayload replaces supported tokens. [split] is handled as a write
+// boundary by writePayload, rather than being sent literally to the server.
+func expandPayload(payload string, c Config) []string {
+	parts := strings.Split(payload, "[split]")
+	replacer := strings.NewReplacer(
+		"[crlf*2]", "\r\n\r\n",
+		"[crlf]", "\r\n",
+		"[cr]", "\r",
+		"[lf]", "\n",
+		"[host]", c.SSHHost,
+		"[port]", strconv.Itoa(c.SSHPort),
+		"[ua]", "Dalvik/2.1.0",
+		"[protocol]", "HTTP/1.1",
+	)
+	for i := range parts {
+		parts[i] = replacer.Replace(parts[i])
+	}
+	return parts
+}
+
+func writePayload(conn net.Conn, payload string, c Config) error {
+	parts := expandPayload(payload, c)
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		if _, err := io.WriteString(conn, part); err != nil {
+			return fmt.Errorf("gagal mengirim bagian payload %d: %w", i+1, err)
+		}
+		// TCP is a byte stream: [split] separates writes, not guaranteed packets.
+		if i < len(parts)-1 {
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+// consumeProxyResponse reads an HTTP proxy response while preserving any
+// buffered bytes that belong to the SSH stream.
+func consumeProxyResponse(conn net.Conn) (net.Conn, error) {
+	reader := bufio.NewReaderSize(conn, 4096)
+	firstLine, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("menunggu respons proxy: %w", err)
+	}
+
+	if strings.HasPrefix(firstLine, "SSH-") {
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
+	if !strings.HasPrefix(firstLine, "HTTP/") {
+		return nil, fmt.Errorf("respons proxy bukan HTTP: %q", strings.TrimSpace(firstLine))
+	}
+
+	fields := strings.Fields(firstLine)
+	if len(fields) < 2 {
+		return nil, fmt.Errorf("status HTTP proxy tidak valid: %q", strings.TrimSpace(firstLine))
+	}
+	status, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return nil, fmt.Errorf("status HTTP proxy tidak valid: %q", strings.TrimSpace(firstLine))
+	}
+
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			return nil, fmt.Errorf("header respons proxy tidak lengkap: %w", readErr)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	if status != http.StatusOK && status != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("proxy menolak payload: %s", strings.TrimSpace(firstLine))
+	}
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
 func dialTunnel(c Config) (net.Conn, error) {
 	targetHost, targetPort := c.SSHHost, c.SSHPort
 	if c.ProxyHost != "" && c.ProxyPort > 0 {
 		targetHost, targetPort = c.ProxyHost, c.ProxyPort
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)), 12*time.Second)
+	conn, err := net.DialTimeout(
+		"tcp",
+		net.JoinHostPort(targetHost, strconv.Itoa(targetPort)),
+		12*time.Second,
+	)
 	if err != nil {
 		return nil, err
 	}
-	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
+
 	if c.Mode == "tls" || c.Mode == "payload_tls" {
 		if c.SNI == "" {
 			conn.Close()
@@ -115,45 +208,28 @@ func dialTunnel(c Config) (net.Conn, error) {
 		t := tlsClient(conn, c.SNI)
 		if err = t.Handshake(); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("TLS handshake gagal: %w", err)
 		}
 		conn = t
 	}
+
 	if c.Mode == "payload" || c.Mode == "payload_tls" {
-		p := strings.NewReplacer("[crlf*2]", "\r\n\r\n", "[crlf]", "\r\n", "[cr]", "\r", "[lf]", "\n", "[host]", c.SSHHost, "[port]", strconv.Itoa(c.SSHPort), "[ua]", "Dalvik/2.1.0", "[protocol]", "HTTP/1.1").Replace(c.Payload)
-		if _, err = io.WriteString(conn, p); err != nil {
+		if strings.TrimSpace(c.Payload) == "" {
+			conn.Close()
+			return nil, errors.New("payload belum diisi")
+		}
+		if err = writePayload(conn, c.Payload, c); err != nil {
 			conn.Close()
 			return nil, err
 		}
-		// Consume proxy response headers, but preserve the SSH banner if it follows.
-		buf := make([]byte, 1)
-		var line strings.Builder
-		for i := 0; i < 8192; i++ {
-			n, e := conn.Read(buf)
-			if e != nil {
-				conn.Close()
-				return nil, e
-			}
-			if n > 0 {
-				line.WriteByte(buf[0])
-				if strings.HasSuffix(line.String(), "\r\n\r\n") {
-					break
-				}
-			}
-		}
-		resp := line.String()
-		if strings.HasPrefix(resp, "HTTP/") && !strings.Contains(resp, " 200 ") {
+		conn, err = consumeProxyResponse(conn)
+		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("proxy menolak payload: %s", strings.TrimSpace(resp))
-		}
-		// A compliant HTTP proxy should respond 200 before SSH. If no HTTP response
-		// was sent and SSH banner is already in the consumed bytes, fail explicitly.
-		if strings.HasPrefix(resp, "SSH-") {
-			conn.Close()
-			return nil, errors.New("payload tidak mendapat respons HTTP; gunakan mode direct atau periksa payload")
+			return nil, err
 		}
 	}
-	conn.SetDeadline(time.Time{})
+
+	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 
