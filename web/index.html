@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HTTP Custom Headers VPN</title><style>
+:root{color-scheme:dark;font:15px system-ui;background:#0b1020;color:#e8edf7}*{box-sizing:border-box}body{margin:0}header{padding:18px max(18px,calc((100% - 980px)/2));background:#121a30;border-bottom:1px solid #273451}main{max-width:980px;margin:22px auto;padding:0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#121a30;border:1px solid #273451;border-radius:14px;padding:16px;margin-bottom:14px}h1{font-size:20px;margin:0}h2{font-size:17px;margin:0 0 14px}label{display:block;color:#aab7d0;font-size:13px;margin:10px 0 5px}input,select,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid #354461;background:#0b1326;color:#f2f5fb}textarea{min-height:105px;font-family:monospace}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}button{border:0;border-radius:8px;padding:10px 15px;font-weight:650;background:#2b6de0;color:white}button.stop{background:#9d3447}button.neutral{background:#354461}.status{font-size:13px;color:#9fb1d0;margin-top:8px}pre{white-space:pre-wrap;word-break:break-word;background:#080d19;border-radius:8px;padding:12px;min-height:150px;max-height:350px;overflow:auto;color:#b9e5c5}small{color:#9fb1d0}
+</style></head><body><header><h1>HTTP Custom Headers VPN <small>· KernelSU</small></h1><div id="status" class="status">Memuat status…</div></header>
+<main><div class="grid"><section class="card"><h2>Konfigurasi SSH & Tunnel</h2>
+<label>Mode koneksi</label><select id="mode"><option value="direct">SSH Direct</option><option value="payload">HTTP Payload</option><option value="tls">TLS / SNI</option><option value="payload_tls">Payload + TLS / SNI</option></select>
+<label>SSH Host</label><input id="ssh_host" placeholder="server.example.com">
+<label>SSH Port</label><input id="ssh_port" type="number" value="443">
+<label>SSH Username</label><input id="ssh_user">
+<label>Metode autentikasi</label><select id="auth_method"><option value="password">Password</option><option value="privatekey">Private key (path di perangkat)</option></select>
+<label>SSH Password</label><input id="ssh_password" type="password">
+<label>Path private key</label><input id="ssh_private_key" placeholder="/data/adb/.../id_rsa">
+<label><input id="compression" type="checkbox" style="width:auto"> Aktifkan kompresi (opsi)</label>
+</section><section class="card"><h2>HTTP Payload & SNI</h2>
+<label>Payload</label><textarea id="payload"></textarea>
+<small>Token: [host], [port], [crlf], [crlf*2], [lf], [ua], [protocol]</small>
+<label>Proxy host (opsional)</label><input id="proxy_host">
+<label>Proxy port (opsional)</label><input id="proxy_port" type="number">
+<label>SNI hostname</label><input id="sni" placeholder="example.com">
+<label>SOCKS5 listen port</label><input id="socks_port" type="number" value="1080">
+<label>Web panel port</label><input id="web_port" type="number" value="8787">
+<div class="buttons"><button onclick="save()">Simpan konfigurasi</button></div>
+</section></div>
+<section class="card"><h2>Kontrol tunnel</h2><div class="buttons"><button onclick="action('start')">Start</button><button class="stop" onclick="action('stop')">Stop</button><button class="neutral" onclick="action('restart')">Restart</button><button class="neutral" onclick="refresh()">Refresh status/log</button></div><div id="message" class="status"></div></section>
+<section class="card"><h2>Log</h2><pre id="logs">Menunggu log…</pre></section>
+<p><small>Panel hanya bind ke 127.0.0.1 secara default. Jangan ubah ke 0.0.0.0 kecuali memahami risiko akses jaringan.</small></p></main>
+<script>
+const ids=['mode','ssh_host','ssh_port','ssh_user','ssh_password','ssh_private_key','auth_method','payload','proxy_host','proxy_port','sni','socks_port','web_port'];
+async function load(){let c=await (await fetch('/api/config')).json();ids.forEach(k=>{let e=document.getElementById(k);if(e)e.value=c[k]??''});document.getElementById('compression').checked=!!c.compression;refresh()}
+async function save(){let c={};ids.forEach(k=>{let e=document.getElementById(k);c[k]=['ssh_port','proxy_port','socks_port','web_port'].includes(k)?Number(e.value):e.value});c.compression=document.getElementById('compression').checked;let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});document.getElementById('message').textContent=r.ok?'Konfigurasi tersimpan':'Gagal menyimpan: '+await r.text();refresh()}
+async function action(a){let r=await fetch('/api/action/'+a,{method:'POST'});document.getElementById('message').textContent=r.ok?('Perintah '+a+' berhasil dikirim'):('Gagal: '+await r.text());refresh()}
+async function refresh(){try{let s=await (await fetch('/api/status')).json();document.getElementById('status').textContent=(s.running?'● Tunnel aktif':'○ Tunnel berhenti')+' · SOCKS5 '+s.socks;let l=await (await fetch('/api/logs')).json();document.getElementById('logs').textContent=l.join('\n')||'Belum ada log';document.getElementById('logs').scrollTop=999999}catch(e){document.getElementById('status').textContent='Panel belum terhubung'}}
+load();setInterval(refresh,3000);
+</script></body></html>
